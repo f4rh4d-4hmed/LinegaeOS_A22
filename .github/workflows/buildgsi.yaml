@@ -1,0 +1,171 @@
+name: LineageOS GSI Build and Upload
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      build_targets:
+        description: 'Build targets (e.g., A64VN A64GN 64VN 64GN)'
+        required: true
+        default: 'A64VN A64GN 64VN 64GN'
+        type: string
+      upload_to_telegram:
+        description: 'Upload to Telegram'
+        required: true
+        default: true
+        type: boolean
+  
+  # Scheduled build (every Sunday at 2 AM UTC)
+  schedule:
+    - cron: '0 2 * * 0'
+
+env:
+  BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 480 # 8 hours timeout
+    
+    steps:
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 2048
+        swap-size-mb: 4096
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-docker-images: 'true'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          bc bison build-essential ccache curl flex \
+          g++-multilib gcc-multilib git gnupg gperf \
+          imagemagick lib32ncurses5-dev lib32readline-dev \
+          lib32z1-dev liblz4-tool libncurses5 libncurses5-dev \
+          libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+          lzop pngcrush rsync schedtool squashfs-tools \
+          xsltproc zip zlib1g-dev python3 python-is-python3 \
+          openjdk-8-jdk android-tools-adb android-tools-fastboot
+
+    - name: Set up environment
+      run: |
+        git config --global user.email "action@github.com"
+        git config --global user.name "GitHub Action"
+        
+        # Install repo
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
+        
+        # Set up ccache
+        export USE_CCACHE=1
+        export CCACHE_EXEC=/usr/bin/ccache
+        ccache -M 25G
+
+    - name: Initialize LineageOS workspace
+      run: |
+        mkdir -p ~/lineage-21-pre-qpr2-build-td
+        cd ~/lineage-21-pre-qpr2-build-td
+        repo init -u https://github.com/LOS21-pre-QPR2/android.git -b lineage-21.0 --git-lfs --depth=1
+
+    - name: Clone build scripts and patches
+      run: |
+        cd ~/lineage-21-pre-qpr2-build-td
+        git clone https://github.com/AndyCGYan/lineage_build_unified lineage_build_unified -b lineage-21-pre-qpr2-td --depth=1
+        git clone https://github.com/AndyCGYan/lineage_patches_unified lineage_patches_unified -b lineage-21-pre-qpr2-td --depth=1
+
+    - name: Sync LineageOS sources
+      run: |
+        cd ~/lineage-21-pre-qpr2-build-td
+        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+    - name: Build LineageOS GSI
+      run: |
+        cd ~/lineage-21-pre-qpr2-build-td
+        
+        # Set build targets from input or default
+        BUILD_TARGETS="${{ github.event.inputs.build_targets || 'A64VN A64GN 64VN 64GN' }}"
+        
+        # Start the build
+        bash lineage_build_unified/build_unified.sh treble $BUILD_TARGETS
+
+    - name: Prepare artifacts for upload
+      if: always()
+      run: |
+        cd ~/lineage-21-pre-qpr2-build-td
+        
+        # Create upload directory
+        mkdir -p ~/upload
+        
+        # Find and copy built images
+        find out/ -name "*.img" -o -name "*.zip" | while read -r file; do
+          if [[ -f "$file" ]]; then
+            cp "$file" ~/upload/
+          fi
+        done
+        
+        # Create build info
+        DATE=$(date +"%d-%m-%Y %H:%M")
+        BUILD_INFO="LineageOS 21 GSI Build - $DATE"
+        echo "$BUILD_INFO" > ~/upload/build_info.txt
+        
+        # List files for verification
+        ls -la ~/upload/
+
+    - name: Upload to Telegram
+      if: ${{ github.event.inputs.upload_to_telegram != 'false' && (env.BOT_TOKEN != '' && env.CHAT_ID != '') }}
+      run: |
+        cd ~/upload
+        
+        DATE=$(date +"%d-%m-%Y %H:%M")
+        BUILD_TARGETS="${{ github.event.inputs.build_targets || 'A64VN A64GN 64VN 64GN' }}"
+        
+        # Count built files
+        IMG_COUNT=$(find . -name "*.img" | wc -l)
+        ZIP_COUNT=$(find . -name "*.zip" | wc -l)
+        
+        CAPTION="*LineageOS 21 GSI Build - $DATE*
+        \`\`\`
+        Targets: $BUILD_TARGETS
+        Images built: $IMG_COUNT
+        Zip files: $ZIP_COUNT
+        Branch: lineage-21-pre-qpr2-td
+        \`\`\`
+        *Flash via fastboot or custom recovery*"
+        
+        # Upload each file
+        for file in *.img *.zip; do
+          if [[ -f "$file" ]]; then
+            echo "Uploading $file..."
+            curl -F document=@"$file" \
+                 -F "chat_id=$CHAT_ID" \
+                 -F "caption=$CAPTION" \
+                 -F "parse_mode=Markdown" \
+                 https://api.telegram.org/bot$BOT_TOKEN/sendDocument
+                 
+            # Add delay between uploads to avoid rate limiting
+            sleep 5
+          fi
+        done
+
+    - name: Upload artifacts to GitHub
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: lineageos-gsi-${{ github.run_number }}
+        path: ~/upload/
+        retention-days: 7
+
+    - name: Clean up workspace
+      if: always()
+      run: |
+        cd ~
+        rm -rf lineage-21-pre-qpr2-build-td
+        ccache -C
