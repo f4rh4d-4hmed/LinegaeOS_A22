@@ -1,7 +1,6 @@
 name: LineageOS GSI Build and Upload
 
 on:
-  # Manual trigger
   workflow_dispatch:
     inputs:
       build_targets:
@@ -14,10 +13,6 @@ on:
         required: true
         default: true
         type: boolean
-  
-  # Scheduled build (every Sunday at 2 AM UTC)
-  schedule:
-    - cron: '0 2 * * 0'
 
 env:
   BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -26,7 +21,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 480 # 8 hours timeout
+    timeout-minutes: 480 # timeout
     
     steps:
     - name: Maximize build space
@@ -51,7 +46,8 @@ jobs:
           libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
           lzop pngcrush rsync schedtool squashfs-tools \
           xsltproc zip zlib1g-dev python3 python-is-python3 \
-          openjdk-8-jdk android-tools-adb android-tools-fastboot
+          openjdk-8-jdk android-tools-adb android-tools-fastboot \
+          xz-utils bc
 
     - name: Set up environment
       run: |
@@ -96,13 +92,13 @@ jobs:
         # Start the build
         bash lineage_build_unified/build_unified.sh treble $BUILD_TARGETS
 
-    - name: Prepare artifacts for upload
+    - name: Prepare and compress artifacts for upload
       if: always()
       run: |
         cd ~/lineage-21-pre-qpr2-build-td
         
-        # Create upload directory
-        mkdir -p ~/upload
+        # Create upload directories
+        mkdir -p ~/upload ~/upload_compressed
         
         # Find and copy built images
         find out/ -name "*.img" -o -name "*.zip" | while read -r file; do
@@ -113,42 +109,116 @@ jobs:
         
         # Create build info
         DATE=$(date +"%d-%m-%Y %H:%M")
-        BUILD_INFO="LineageOS 21 GSI Build - $DATE"
+        BUILD_TARGETS="${{ github.event.inputs.build_targets || 'A64VN A64GN 64VN 64GN' }}"
+        BUILD_INFO="LineageOS 21 GSI Build - $DATE
+        Targets: $BUILD_TARGETS
+        Compression: XZ (LZMA2) Level 6"
         echo "$BUILD_INFO" > ~/upload/build_info.txt
         
-        # List files for verification
-        ls -la ~/upload/
+        # Compress files with XZ for Telegram upload
+        cd ~/upload
+        echo "Starting compression of built files..."
+        
+        for file in *.img *.zip; do
+          if [[ -f "$file" ]]; then
+            echo "Compressing $file..."
+            
+            # Get file size before compression
+            ORIGINAL_SIZE=$(stat -c%s "$file" 2>/dev/null || echo "0")
+            
+            # Compress with XZ (level 6 for good balance of speed vs compression)
+            # -T 0 uses all available CPU cores
+            xz -6 -T 0 -v "$file"
+            COMPRESSED_FILE="${file}.xz"
+            
+            if [[ -f "$COMPRESSED_FILE" ]]; then
+              # Get compressed size
+              COMPRESSED_SIZE=$(stat -c%s "$COMPRESSED_FILE" 2>/dev/null || echo "0")
+              
+              # Calculate compression ratio
+              if [[ $ORIGINAL_SIZE -gt 0 ]]; then
+                RATIO=$(echo "scale=1; $COMPRESSED_SIZE * 100 / $ORIGINAL_SIZE" | bc -l 2>/dev/null || echo "N/A")
+                echo "✓ $file -> $COMPRESSED_FILE"
+                echo "  Original: $(numfmt --to=iec-i --suffix=B $ORIGINAL_SIZE)"
+                echo "  Compressed: $(numfmt --to=iec-i --suffix=B $COMPRESSED_SIZE) (${RATIO}%)"
+              fi
+              
+              # Move compressed file to upload directory
+              mv "$COMPRESSED_FILE" ~/upload_compressed/
+            else
+              echo "❌ Failed to compress $file"
+            fi
+          fi
+        done
+        
+        # Also compress the build info
+        cp build_info.txt ~/upload_compressed/
+        
+        echo "Compression completed!"
+        echo "Files ready for upload:"
+        ls -la ~/upload_compressed/
 
     - name: Upload to Telegram
       if: ${{ github.event.inputs.upload_to_telegram != 'false' && (env.BOT_TOKEN != '' && env.CHAT_ID != '') }}
       run: |
-        cd ~/upload
+        cd ~/upload_compressed
         
         DATE=$(date +"%d-%m-%Y %H:%M")
         BUILD_TARGETS="${{ github.event.inputs.build_targets || 'A64VN A64GN 64VN 64GN' }}"
         
-        # Count built files
-        IMG_COUNT=$(find . -name "*.img" | wc -l)
-        ZIP_COUNT=$(find . -name "*.zip" | wc -l)
+        # Count files
+        XZ_COUNT=$(find . -name "*.xz" | wc -l)
+        
+        # Calculate total compressed size
+        TOTAL_SIZE=0
+        if command -v numfmt >/dev/null 2>&1; then
+          for file in *.xz; do
+            if [[ -f "$file" ]]; then
+              SIZE=$(stat -c%s "$file" 2>/dev/null || echo "0")
+              TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+            fi
+          done
+          TOTAL_SIZE_HUMAN=$(numfmt --to=iec-i --suffix=B $TOTAL_SIZE)
+        else
+          TOTAL_SIZE_HUMAN="Unknown"
+        fi
         
         CAPTION="*LineageOS 21 GSI Build - $DATE*
         \`\`\`
         Targets: $BUILD_TARGETS
-        Images built: $IMG_COUNT
-        Zip files: $ZIP_COUNT
+        Files: $XZ_COUNT (.xz compressed)
+        Total size: $TOTAL_SIZE_HUMAN
+        Compression: XZ (LZMA2) Level 6
         Branch: lineage-21-pre-qpr2-td
         \`\`\`
-        *Flash via fastboot or custom recovery*"
+        *Decompress with: xz -d filename.img.xz*
+        *Flash decompressed .img via fastboot*"
         
-        # Upload each file
-        for file in *.img *.zip; do
+        # Upload each compressed file
+        for file in *.xz build_info.txt; do
           if [[ -f "$file" ]]; then
             echo "Uploading $file..."
-            curl -F document=@"$file" \
-                 -F "chat_id=$CHAT_ID" \
-                 -F "caption=$CAPTION" \
-                 -F "parse_mode=Markdown" \
-                 https://api.telegram.org/bot$BOT_TOKEN/sendDocument
+            
+            # Check file size (Telegram limit is 50MB)
+            FILE_SIZE=$(stat -c%s "$file" 2>/dev/null || echo "0")
+            FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+            
+            if [[ $FILE_SIZE_MB -gt 50 ]]; then
+              echo "⚠️ Warning: $file is ${FILE_SIZE_MB}MB, exceeding Telegram's 50MB limit"
+              echo "Consider using higher compression or splitting the file"
+              continue
+            fi
+            
+            # Upload to Telegram
+            if curl -F document=@"$file" \
+                    -F "chat_id=$CHAT_ID" \
+                    -F "caption=$CAPTION" \
+                    -F "parse_mode=Markdown" \
+                    https://api.telegram.org/bot$BOT_TOKEN/sendDocument; then
+              echo "✅ Successfully uploaded $file"
+            else
+              echo "❌ Failed to upload $file"
+            fi
                  
             # Add delay between uploads to avoid rate limiting
             sleep 5
@@ -160,7 +230,9 @@ jobs:
       if: always()
       with:
         name: lineageos-gsi-${{ github.run_number }}
-        path: ~/upload/
+        path: |
+          ~/upload/
+          ~/upload_compressed/
         retention-days: 7
 
     - name: Clean up workspace
