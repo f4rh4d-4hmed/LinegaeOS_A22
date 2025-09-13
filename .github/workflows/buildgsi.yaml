@@ -1,6 +1,7 @@
 name: LineageOS GSI Build and Upload
 
 on:
+  # Manual trigger only - no automatic builds to save GitHub Actions minutes
   workflow_dispatch:
     inputs:
       build_targets:
@@ -21,19 +22,58 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 480 # timeout
+    timeout-minutes: 480 # 8 hours timeout
     
     steps:
     - name: Maximize build space
       uses: easimon/maximize-build-space@master
       with:
-        root-reserve-mb: 2048
+        root-reserve-mb: 1024
         swap-size-mb: 4096
         remove-dotnet: 'true'
         remove-android: 'true'
         remove-haskell: 'true'
         remove-codeql: 'true'
         remove-docker-images: 'true'
+        build-mount-path: '/mnt/build'
+
+    - name: Additional space cleanup and setup
+      run: |
+        # Remove more unnecessary packages and files
+        sudo apt-get clean
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /var/lib/gems
+        
+        # Clean package cache
+        sudo apt-get autoclean
+        sudo apt-get autoremove -y
+        
+        # Clear temp files
+        sudo rm -rf /tmp/*
+        sudo rm -rf /var/tmp/*
+        
+        # Setup build directory on the larger mount
+        mkdir -p /mnt/build
+        sudo chown -R $USER:$USER /mnt/build
+        
+        # Check available space
+        echo "Available space after cleanup:"
+        df -h
+        
+        # Ensure we have enough space (at least 80GB)
+        AVAILABLE_GB=$(df /mnt/build | awk 'NR==2 {print int($4/1024/1024)}')
+        echo "Available space for build: ${AVAILABLE_GB}GB"
+        
+        if [ $AVAILABLE_GB -lt 80 ]; then
+          echo "❌ Insufficient space: ${AVAILABLE_GB}GB available, need at least 80GB"
+          echo "💡 Consider reducing build targets or using GitHub's larger runners"
+          exit 1
+        fi
 
     - name: Install dependencies
       run: |
@@ -67,35 +107,47 @@ jobs:
 
     - name: Initialize LineageOS workspace
       run: |
-        mkdir -p ~/lineage-21-pre-qpr2-build-td
-        cd ~/lineage-21-pre-qpr2-build-td
+        # Use the larger mount point for builds
+        mkdir -p /mnt/build/lineage-21-pre-qpr2-build-td
+        cd /mnt/build/lineage-21-pre-qpr2-build-td
+        
         repo init -u https://github.com/LOS21-pre-QPR2/android.git -b lineage-21.0 --git-lfs --depth=1
 
     - name: Clone build scripts and patches
       run: |
-        cd ~/lineage-21-pre-qpr2-build-td
+        cd /mnt/build/lineage-21-pre-qpr2-build-td
         git clone https://github.com/AndyCGYan/lineage_build_unified lineage_build_unified -b lineage-21-pre-qpr2-td --depth=1
         git clone https://github.com/AndyCGYan/lineage_patches_unified lineage_patches_unified -b lineage-21-pre-qpr2-td --depth=1
 
     - name: Sync LineageOS sources
       run: |
-        cd ~/lineage-21-pre-qpr2-build-td
-        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+        cd /mnt/build/lineage-21-pre-qpr2-build-td
+        
+        # Use fewer parallel jobs to reduce memory usage
+        repo sync -c -j$(( $(nproc --all) / 2 )) --force-sync --no-clone-bundle --no-tags
 
     - name: Build LineageOS GSI
       run: |
-        cd ~/lineage-21-pre-qpr2-build-td
+        cd /mnt/build/lineage-21-pre-qpr2-build-td
         
         # Set build targets from input or default
         BUILD_TARGETS="${{ github.event.inputs.build_targets || 'A64VN A64GN 64VN 64GN' }}"
         
-        # Start the build
+        # Monitor disk space during build
+        echo "Disk space before build:"
+        df -h /mnt/build
+        
+        # Start the build with memory optimization
+        export USE_CCACHE=1
+        export CCACHE_DIR=/mnt/build/.ccache
+        export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx4g"
+        
         bash lineage_build_unified/build_unified.sh treble $BUILD_TARGETS
 
     - name: Prepare and compress artifacts for upload
       if: always()
       run: |
-        cd ~/lineage-21-pre-qpr2-build-td
+        cd /mnt/build/lineage-21-pre-qpr2-build-td
         
         # Create upload directories
         mkdir -p ~/upload ~/upload_compressed
@@ -230,14 +282,12 @@ jobs:
       if: always()
       with:
         name: lineageos-gsi-${{ github.run_number }}
-        path: |
-          ~/upload/
-          ~/upload_compressed/
+        path: ~/upload/
         retention-days: 7
 
     - name: Clean up workspace
       if: always()
       run: |
         cd ~
-        rm -rf lineage-21-pre-qpr2-build-td
+        rm -rf /mnt/build/lineage-21-pre-qpr2-build-td
         ccache -C
